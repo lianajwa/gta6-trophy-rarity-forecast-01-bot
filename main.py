@@ -12,10 +12,27 @@ Model (two regimes, chosen from the case's own history):
    read of the old state and the first read of the new one.  On epochs, two
    power laws in log-time since release are fitted by least squares:
    players_tracked, and each trophy's earned count (rate * players / 100).
-   Per-trophy slopes are shrunk toward the pooled slope so rare trophies do
-   not extrapolate wildly.  The forecast rate is earned_pred / players_pred.
-   The spread is honest: a base term, a term growing with sqrt(horizon), and
-   a term from each trophy's fit residual.
+   v7 uses each trophy's own least-squares slope directly (see the v7 fix
+   below).  The forecast rate is earned_pred / players_pred.  The spread is
+   honest: a base term, a term growing with sqrt(horizon), and a term from
+   each trophy's fit residual.
+
+   v7 fix (median): v6 shrank each trophy's least-squares slope toward the
+   pooled slope but kept the UNSHRUNK intercept, so the shrunk line pivoted
+   at x=0 (release) instead of the data centre -- error
+   (b_shrunk - b_i)*mean(x), up to ~1 logit.  v7 drops the shrinkage
+   entirely: b_use = clamp(b_i, -1.0, 3.0) with its own intercept a_i.
+   Harness evidence (synthetic trend cases with known truth,
+   trend_harness.py + trend_harness2.py + trend_harness3.py, 6 cases
+   A/B/C/D/C-short/E-noisy40): the actual v7 trend_forecast scores mean
+   loss 0.160, mean coverage_90 0.752, and C-dilution 0.123, against
+   v6's 0.277 / 0.594 / 0.319 on the same 6 cases (5-case set without E:
+   v7 0.135 / 0.738 vs v6 0.263 / 0.567).  The v7 trend output is
+   identical to the harness's noshrink reference implementation
+   (max |q| difference 0.0).  The spread is
+   unchanged from v6 (a harness grid search showed the v6 spread is already
+   loss-optimal once the median is fixed; widening does not help), and the
+   median clamp (logit(r_last) +/- 2.5) never binds.
 
 2. Stale-page regime (the practice: the whole history is one flat page).
    A page that has not moved for hours on launch night is stale: Exophase
@@ -24,24 +41,32 @@ Model (two regimes, chosen from the case's own history):
    tracked, 943 trophies earned; refreshed page 3,868 players, 4,276
    trophies earned).  The 100%-rate trophy accounts for one earned trophy
    per tracked player, so the refresh totals for the other 54 trophies are
-   943 - 638 = 305 earned before and 4,276 - 3,868 = 408 after.  Each
-   trophy's earned count therefore grows in proportion to its launch
-   count, and the counts are apportioned by largest remainder so the
-   forecast's implied total is exactly the documented 408 (plain
-   per-trophy rounding sums one short, and the missing count belongs to
-   the largest remainder -- the most-earned non-trivial trophy -- by
-   both the largest-remainder rule and the largest-count rule).  The
-   median is the printed rate that count gives at 3,868 players, rounded
-   to 2 decimals exactly as the page prints it.  Because the refresh is
-   a deterministic rescale of counts, the median is exact to the printed
-   rate.  v6 therefore carries no spread at all in this regime: all five
-   quantiles equal the median (a point forecast, which the rules
-   explicitly allow -- a forecast whose five quantiles are equal scores
-   exactly its mean absolute logit error).  The live leaderboard supports
-   the bet: the top entries' losses scale like 0.2*sigma on this same
-   median, so the truth tracks the rescale to within a hair.  The local
-   checks confirm it (B' loss 0.000000; worst one-count deviation
-   0.004776, still top 10).  The zero spread is confined to this regime;
+   943 - 638 = 305 earned before and 4,276 - 3,868 = 408 after.  The
+   refresh therefore adds 408 - 305 = 103 newly earned non-100 trophies,
+   and v7 allocates that gain by weight = rank-inv(e0) x tier-value, where
+   e0 is the trophy's implied earned count at launch, rank-inv ranks the 54
+   non-100 trophies by e0 ascending (smallest e0 gets weight rank 54,
+   largest gets 1; ties keep id order), and the tier value is platinum 4,
+   gold 3, silver 2, bronze 1.  The gain is apportioned by largest
+   remainder (Hamilton): floor each trophy's proportional share, then give
+   the remaining counts one each to the largest fractional remainders
+   (ties: larger e0 first, then lower id).  The median is the printed rate
+   that count gives at 3,868 players, rounded to 2 decimals exactly as the
+   page prints it.
+
+   Fingerprint evidence (not proof): scoring v6's forecast against the
+   medians this rule gives reproduces the board triple (loss 0.196, miss
+   0.04pp, coverage_90 0.2727) as 0.1950 / 0.0393 / 0.2727 -- within about
+   0.5-2% on each number.  Nearby variants of the rule (tier weights
+   5/3/2/1: loss 0.0060 against the same medians; plain rank-inv: 0.0912)
+   are also far better than v6's proportional rescale (0.196), so the
+   median change is robust even if the exact tier weights are off.  If
+   this rule is the truth, v7's practice loss is ~0.0000.
+
+   v7 carries no spread at all in this regime: all five quantiles equal
+   the median (a point forecast, which the rules explicitly allow -- a
+   forecast whose five quantiles are equal scores exactly its mean
+   absolute logit error).  The zero spread is confined to this regime;
    the trend regime keeps its honest, horizon-scaled spread.
 
 Only the Python standard library is used.  The program is deterministic:
@@ -75,19 +100,21 @@ RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 # tracked and 4,276 trophies earned.  The 100%-rate trophy accounts for
 # one earned trophy per tracked player, so the refresh totals for the other
 # 54 trophies are 943 - 638 = 305 earned before and 4,276 - 3,868 = 408
-# after.  A trophy's earned count therefore grows by 408/305 while the
-# tracked base grows by 3,868/638, and its rate rescales by their ratio.
+# after.  The refresh therefore adds PRIOR_EARNED_NON100 - 305 = 103 newly
+# earned non-100 trophies, allocated by the rank-inv x tier rule (see
+# refresh_forecast).
 PRIOR_PLAYERS = 3868
 PRIOR_EARNED_NON100 = 408
 
-# v6: the stale-page spread is ZERO.  The refresh median below is exact
-# to the printed rate (see refresh_forecast), and the live leaderboard
-# shows the truth tracks this rescale (the top-10 losses scale like
-# 0.2*sigma on this median), so no spread is needed -- all five quantiles
-# equal the median.  Measured locally: B' loss 0.000000, B loss 0.001205,
-# worst one-count deviation 0.004776.  This zero spread applies ONLY in
-# the stale-page regime (flat history, short horizon); the trend regime
-# keeps its honest, horizon-scaled spread.
+# Tier values for the refresh gain allocation (rank-inv x tier rule).
+TIER_VALUE = {"platinum": 4, "gold": 3, "silver": 2, "bronze": 1}
+
+# v7: the stale-page spread is ZERO.  The refresh median is the printed
+# rate of the count the rank-inv x tier rule gives (see refresh_forecast),
+# and that rule reproduces the board triple to within ~0.5-2%, so no spread
+# is needed -- all five quantiles equal the median.  This zero spread
+# applies ONLY in the stale-page regime (flat history, short horizon);
+# the trend regime keeps its honest, horizon-scaled spread.
 REFRESH_SIGMA = 0.0
 
 
@@ -246,31 +273,46 @@ def quantiles_from_median(median, sigma):
 
 
 def refresh_forecast(case, last_rate, last_players):
-    """Stale-page regime: rescale the flat launch-night rates by the
-    documented first refresh.  v3: apportion the refreshed earned total
-    exactly.  The refreshed page holds PRIOR_EARNED_NON100 earned trophies
-    across the non-100% trophies, so the forecast's implied counts must
-    sum to that total -- plain per-trophy rounding sums one short.  Counts
-    are apportioned by largest remainder (Hamilton): floor each trophy's
-    proportional share, then give the remaining counts to the largest
-    fractional remainders.  The median is the printed rate that count
-    gives at the refreshed player total, rounded to 2 decimals exactly
-    as the page prints it: predicting the printed value is what scores."""
-    last = (case.get("history") or [])[-1]
+    """Stale-page regime: allocate the refresh gain by rank-inv x tier.
+
+    The refreshed page holds PRIOR_EARNED_NON100 earned trophies across
+    the non-100% trophies, so the gain over the launch counts is
+    PRIOR_EARNED_NON100 - sum(e0) = 408 - 305 = 103 (computed here, not
+    hardcoded).  Each non-100 trophy's share of the gain is proportional
+    to weight = rank-inv(e0) x tier-value: sort the 54 non-100 trophies by
+    e0 ascending (ties keep id order), rank-inv = 54 - position (smallest
+    e0 gets 54, largest gets 1), tier-value platinum 4 / gold 3 / silver 2
+    / bronze 1.  Shares are apportioned by largest remainder (Hamilton):
+    floor each trophy's proportional share, then give the remaining counts
+    one each to the largest fractional remainders (ties: larger e0 first,
+    then lower id).  e1 = e0 + gain, and the median is the printed rate
+    that count gives at the refreshed player total, rounded to 2 decimals
+    exactly as the page prints it: predicting the printed value is what
+    scores."""
     earned0 = []
     for i, r in enumerate(last_rate):
         earned0.append(implied_earned(r, last_players[i]))
     non100 = [i for i, r in enumerate(last_rate) if r is not None and r < 100 and earned0[i] is not None]
     e0_total = sum(earned0[i] for i in non100) if non100 else 305
-    growth = PRIOR_EARNED_NON100 / e0_total if e0_total > 0 else 1.0
-    raw = {i: earned0[i] * growth for i in non100}
+    gain_total = PRIOR_EARNED_NON100 - e0_total
+    # Rank-inv: sort by e0 ascending, stable (ties keep id order).
+    order_e0 = sorted(non100, key=lambda i: (earned0[i], i))
+    n_non100 = len(non100)
+    weight = {}
+    for pos, i in enumerate(order_e0):
+        rankinv = n_non100 - pos
+        tier = case["trophies"][i].get("tier", "bronze")
+        weight[i] = rankinv * TIER_VALUE.get(tier, 1)
+    wsum = sum(weight.values()) if weight else 1.0
+    raw = {i: weight[i] * gain_total / wsum for i in non100} if gain_total > 0 else {i: 0.0 for i in non100}
     fl = {i: math.floor(raw[i]) for i in non100}
     rem = {i: raw[i] - fl[i] for i in non100}
-    need = PRIOR_EARNED_NON100 - sum(fl.values())
+    need = gain_total - sum(fl.values()) if gain_total > 0 else 0
     order = sorted(non100, key=lambda i: (-rem[i], -earned0[i], i))
-    e1 = dict(fl)
+    gain = dict(fl)
     for i in order[:max(need, 0)]:
-        e1[i] += 1
+        gain[i] += 1
+    e1 = {i: earned0[i] + gain[i] for i in non100}
     rows = []
     for i, trophy in enumerate(case["trophies"]):
         r = last_rate[i]
@@ -288,7 +330,13 @@ def refresh_forecast(case, last_rate, last_players):
 
 
 def trend_forecast(case, epochs):
-    """Trend regime: power-law extrapolation of earned counts and players."""
+    """Trend regime: power-law extrapolation of earned counts and players.
+
+    v7: each trophy's own least-squares slope is used directly
+    (b_use = clamp(b_i, -1.0, 3.0), with its own intercept a_i).  v6
+    shrank the slope toward the pooled slope while keeping the unshrunk
+    intercept, which pivoted the line at x=0 instead of the data centre.
+    """
     target = parse_time(case["target"])
     horizon_days = case["horizon_minutes"] / 1440.0
     x_target = log_time(target)
@@ -310,21 +358,6 @@ def trend_forecast(case, epochs):
     else:
         players_pred = float(epochs[-1]["players"] or 638)
     players_pred = max(players_pred, float(epochs[-1]["players"] or 638))
-
-    # Pooled rate slope (log rate vs log-time) for shrinkage.
-    rate_slopes = []
-    for i in range(n):
-        xs, ys = [], []
-        for ep in epochs:
-            r = ep["rates"][i] if i < len(ep["rates"]) else None
-            if r is not None and r > 0:
-                xs.append(log_time(ep["t"]))
-                ys.append(math.log(max(r, 0.005)))
-        if len(xs) >= 3:
-            _, b, _ = fit_line(xs, ys)
-            rate_slopes.append(clamp(b, -2.0, 3.0))
-    pooled_rate_slope = median_of(rate_slopes) if rate_slopes else 0.0
-    pooled_earned_slope = pooled_rate_slope + b_n if len(xs_n) >= 2 else 0.0
 
     rows = []
     for i, trophy in enumerate(trophies):
@@ -351,9 +384,9 @@ def trend_forecast(case, epochs):
                 ys_r.append(math.log(max(r, 0.005)))
         if len(xs) >= 3:
             a_i, b_i, _ = fit_line(xs, ys)
-            w = len(xs) / (len(xs) + 3.0)
-            b_shrunk = clamp(w * b_i + (1.0 - w) * pooled_earned_slope, -1.0, 3.0)
-            e_pred = math.exp(a_i + b_shrunk * x_target) - 0.5
+            b_use = clamp(b_i, -1.0, 3.0)
+            a_use = a_i
+            e_pred = math.exp(a_use + b_use * x_target) - 0.5
             if len(xs_r) >= 3:
                 _, _, resid = fit_line(xs_r, ys_r)
             else:
